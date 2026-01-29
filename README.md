@@ -9,6 +9,7 @@ Static analysis tool to predict impact of code changes in multi-service systems.
 - **Model Parser**: Extract SQLAlchemy model definitions
 - **Sync Checker**: Detect mismatches between models and migrations
 - **Idempotency Checker**: Detect non-idempotent migration patterns
+- **FK Consistency Checker**: Validate foreign key references and migration order
 - **Live DB Checker**: Compare migrations with actual PostgreSQL schema
 
 ## Installation
@@ -64,6 +65,9 @@ BLAST RADIUS ANALYZER - REPORT
 
 [IDEMPOTENCY] All migrations are idempotent
 
+[FOREIGN KEYS] Found 8 FK definitions
+[FK] All foreign keys are consistent
+
 [LIVE DB] Connected, found 7 tables
 
 [SCHEMA DRIFT] Found 2 issues:
@@ -83,6 +87,8 @@ BLAST RADIUS ANALYZER - REPORT
 |-------|----------------|----------|
 | **Sync Check** | Model fields missing in migrations | Critical |
 | **Idempotency** | Migrations that can fail on retry | Warning |
+| **FK Missing Table** | FK references non-existent table | Critical |
+| **FK Wrong Order** | FK defined before target table created | Critical |
 | **Missing Table** | Table in migrations, not in DB | Critical |
 | **Missing Column** | Column in migrations, not in DB | Critical |
 | **Extra Table** | Table in DB, not in migrations | Warning |
@@ -109,7 +115,7 @@ BLAST RADIUS ANALYZER - REPORT
 - [x] Step 1: Static Spine (docker + SQL + models)
 - [x] Step 2: Idempotency Checker
 - [x] Step 3: Live Database Schema Comparison
-- [ ] Step 4: Foreign Key Consistency Check
+- [x] Step 4: Foreign Key Consistency Check
 - [ ] Step 5: Environment Variable Validation
 - [ ] Step 6: Circular Dependency Detection
 - [ ] Step 7: Git diff integration
