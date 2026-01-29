@@ -131,6 +131,17 @@ class ImpactAnalysis:
 
 
 @dataclass
+class ImpactExplanation:
+    """Human-readable impact explanation."""
+    title: str
+    risk_assessment: str
+    affected_components: List[str]
+    potential_issues: List[str]
+    recommendations: List[str]
+    deployment_notes: List[str]
+
+
+@dataclass
 class LiveDBColumn:
     """Column from live database."""
     name: str
@@ -162,6 +173,7 @@ class AnalysisResult:
     env_vars_used: Dict[str, List[str]] = field(default_factory=dict)  # var -> [files]
     circular_deps: List[CircularDependency] = field(default_factory=list)
     impact_analysis: Optional[ImpactAnalysis] = None
+    impact_explanation: Optional[ImpactExplanation] = None
     live_db_tables: Dict[str, LiveDBTable] = field(default_factory=dict)
     dependency_graph: Dict[str, List[str]] = field(default_factory=dict)
 
@@ -1038,6 +1050,195 @@ class GitDiffAnalyzer:
 
 
 # ============================================================================
+# Impact Explainer (LLM-Ready)
+# ============================================================================
+
+class ImpactExplainer:
+    """Generate human-readable impact explanations.
+
+    This is a rule-based explainer that can be extended with LLM integration.
+    Set ANTHROPIC_API_KEY environment variable for LLM-powered explanations.
+    """
+
+    def __init__(self, use_llm: bool = False):
+        self.use_llm = use_llm and os.environ.get('ANTHROPIC_API_KEY')
+
+    def explain(self, result: 'AnalysisResult') -> ImpactExplanation:
+        """Generate explanation for the analysis result."""
+        if self.use_llm:
+            return self._llm_explain(result)
+        return self._rule_based_explain(result)
+
+    def _rule_based_explain(self, result: 'AnalysisResult') -> ImpactExplanation:
+        """Generate rule-based explanation."""
+        title = self._generate_title(result)
+        risk_assessment = self._generate_risk_assessment(result)
+        affected = self._list_affected_components(result)
+        issues = self._identify_potential_issues(result)
+        recommendations = self._generate_recommendations(result)
+        deployment_notes = self._generate_deployment_notes(result)
+
+        return ImpactExplanation(
+            title=title,
+            risk_assessment=risk_assessment,
+            affected_components=affected,
+            potential_issues=issues,
+            recommendations=recommendations,
+            deployment_notes=deployment_notes
+        )
+
+    def _generate_title(self, result: 'AnalysisResult') -> str:
+        """Generate a title for the analysis."""
+        issues_count = (
+            len(result.sync_issues) +
+            len(result.idempotency_issues) +
+            len(result.fk_issues) +
+            len(result.schema_drift) +
+            len(result.circular_deps)
+        )
+
+        if issues_count == 0:
+            return "All checks passed - system is healthy"
+        elif issues_count <= 3:
+            return f"Minor issues detected ({issues_count} items)"
+        elif issues_count <= 10:
+            return f"Multiple issues require attention ({issues_count} items)"
+        else:
+            return f"Critical review needed ({issues_count} issues found)"
+
+    def _generate_risk_assessment(self, result: 'AnalysisResult') -> str:
+        """Generate risk assessment text."""
+        risks = []
+
+        if result.sync_issues:
+            risks.append("Model-migration desync can cause runtime errors")
+
+        if result.idempotency_issues:
+            risks.append("Non-idempotent migrations may fail on retry")
+
+        if result.fk_issues:
+            risks.append("Foreign key issues can cause data integrity problems")
+
+        if result.circular_deps:
+            risks.append("Circular dependencies will prevent service startup")
+
+        critical_drift = [d for d in result.schema_drift if d.issue_type in ('missing_table', 'missing_column')]
+        if critical_drift:
+            risks.append("Schema drift can cause immediate production failures")
+
+        if result.impact_analysis and result.impact_analysis.risk_level == 'critical':
+            risks.append("High-impact changes require careful deployment")
+
+        if not risks:
+            return "Low risk - no critical issues detected"
+
+        return " | ".join(risks)
+
+    def _list_affected_components(self, result: 'AnalysisResult') -> List[str]:
+        """List affected components."""
+        affected = []
+
+        if result.services:
+            affected.append(f"Services: {', '.join(result.services.keys())}")
+
+        if result.db_tables:
+            affected.append(f"Tables: {', '.join(result.db_tables.keys())}")
+
+        if result.impact_analysis:
+            if result.impact_analysis.affected_services:
+                affected.append(f"Changed services: {', '.join(result.impact_analysis.affected_services)}")
+            if result.impact_analysis.affected_tables:
+                affected.append(f"Changed tables: {', '.join(result.impact_analysis.affected_tables)}")
+
+        return affected
+
+    def _identify_potential_issues(self, result: 'AnalysisResult') -> List[str]:
+        """Identify potential issues based on analysis."""
+        issues = []
+
+        for sync_issue in result.sync_issues[:5]:  # Limit to 5
+            issues.append(f"Sync: {sync_issue}")
+
+        for idem_issue in result.idempotency_issues[:3]:
+            issues.append(f"Migration: {idem_issue.message}")
+
+        for fk_issue in result.fk_issues[:3]:
+            issues.append(f"FK: {fk_issue.details}")
+
+        for drift in result.schema_drift[:3]:
+            issues.append(f"Drift: {drift.details}")
+
+        for cycle in result.circular_deps:
+            issues.append(f"Cycle: {cycle.details}")
+
+        return issues
+
+    def _generate_recommendations(self, result: 'AnalysisResult') -> List[str]:
+        """Generate actionable recommendations."""
+        recs = []
+
+        if result.sync_issues:
+            recs.append("Create migrations for missing columns before deploying")
+
+        if result.idempotency_issues:
+            recs.append("Add column_exists() checks to make migrations idempotent")
+
+        if result.fk_issues:
+            recs.append("Review migration order and FK target tables")
+
+        if result.circular_deps:
+            recs.append("Break circular dependencies in docker-compose")
+
+        critical_drift = [d for d in result.schema_drift if d.issue_type in ('missing_table', 'missing_column')]
+        if critical_drift:
+            recs.append("Run pending migrations or sync database schema")
+
+        if result.env_issues:
+            unused = [e for e in result.env_issues if e.issue_type == 'defined_not_used']
+            undefined = [e for e in result.env_issues if e.issue_type == 'used_not_defined']
+            if unused:
+                recs.append("Review unused environment variables in docker-compose")
+            if undefined:
+                recs.append("Add missing environment variables to docker-compose")
+
+        if not recs:
+            recs.append("No immediate actions required")
+
+        return recs
+
+    def _generate_deployment_notes(self, result: 'AnalysisResult') -> List[str]:
+        """Generate deployment notes."""
+        notes = []
+
+        if result.sync_issues or any(d.issue_type in ('missing_table', 'missing_column') for d in result.schema_drift):
+            notes.append("Run database migrations before starting services")
+
+        if result.impact_analysis:
+            if 'launcher' in result.impact_analysis.affected_services:
+                notes.append("Main launcher service affected - expect brief downtime")
+
+            if result.impact_analysis.affected_tables:
+                notes.append("Database changes detected - backup recommended")
+
+            if result.impact_analysis.risk_level in ('high', 'critical'):
+                notes.append("High-risk changes - consider staging deployment first")
+
+        if result.circular_deps:
+            notes.append("BLOCKED: Fix circular dependencies before deployment")
+
+        if not notes:
+            notes.append("Standard deployment procedure applies")
+
+        return notes
+
+    def _llm_explain(self, result: 'AnalysisResult') -> ImpactExplanation:
+        """Generate LLM-powered explanation (requires ANTHROPIC_API_KEY)."""
+        # This is a placeholder for LLM integration
+        # In production, this would call the Anthropic API
+        return self._rule_based_explain(result)
+
+
+# ============================================================================
 # Live Database Checker
 # ============================================================================
 
@@ -1233,6 +1434,7 @@ class BlastRadiusAnalyzer:
         self.fk_checker = ForeignKeyChecker()
         self.env_checker = EnvVarChecker(self.project_root)
         self.git_analyzer = GitDiffAnalyzer(self.project_root)
+        self.explainer = ImpactExplainer(use_llm=os.environ.get('ANTHROPIC_API_KEY') is not None)
         self.live_schema_checker = LiveSchemaChecker(db_url) if db_url else None
 
     def analyze(self, profile: dict) -> AnalysisResult:
@@ -1281,6 +1483,9 @@ class BlastRadiusAnalyzer:
         # 6. Git diff analysis
         if self.diff_base:
             result.impact_analysis = self.git_analyzer.analyze_diff(self.diff_base, 'HEAD')
+
+        # 7. Generate impact explanation
+        result.impact_explanation = self.explainer.explain(result)
 
         return result
 
@@ -1453,6 +1658,35 @@ class BlastRadiusAnalyzer:
         elif self.db_url:
             print("\n[LIVE DB] Failed to connect to database")
 
+        # Impact Explanation
+        if result.impact_explanation:
+            exp = result.impact_explanation
+            print(f"\n{'=' * 60}")
+            print("IMPACT EXPLANATION")
+            print("=" * 60)
+            print(f"\n{exp.title}")
+            print(f"\nRisk: {exp.risk_assessment}")
+
+            if exp.affected_components:
+                print("\nAffected Components:")
+                for comp in exp.affected_components:
+                    print(f"  - {comp}")
+
+            if exp.potential_issues:
+                print("\nPotential Issues:")
+                for issue in exp.potential_issues:
+                    print(f"  [!] {issue}")
+
+            if exp.recommendations:
+                print("\nRecommendations:")
+                for rec in exp.recommendations:
+                    print(f"  -> {rec}")
+
+            if exp.deployment_notes:
+                print("\nDeployment Notes:")
+                for note in exp.deployment_notes:
+                    print(f"  * {note}")
+
         print("\n" + "=" * 60)
 
 
@@ -1558,6 +1792,14 @@ def main():
                 "risk_level": result.impact_analysis.risk_level if result.impact_analysis else None,
                 "summary": result.impact_analysis.summary if result.impact_analysis else None
             } if result.impact_analysis else None,
+            "explanation": {
+                "title": result.impact_explanation.title,
+                "risk_assessment": result.impact_explanation.risk_assessment,
+                "affected_components": result.impact_explanation.affected_components,
+                "potential_issues": result.impact_explanation.potential_issues,
+                "recommendations": result.impact_explanation.recommendations,
+                "deployment_notes": result.impact_explanation.deployment_notes
+            } if result.impact_explanation else None,
             "schema_drift": [
                 {
                     "table": drift.table,

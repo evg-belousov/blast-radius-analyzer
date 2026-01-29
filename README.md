@@ -13,6 +13,7 @@ Static analysis tool to predict impact of code changes in multi-service systems.
 - **Env Var Checker**: Detect undefined/unused environment variables
 - **Circular Dependency Detector**: Find cycles in service depends_on graph
 - **Git Diff Analyzer**: Map changed files to affected services and tables
+- **Impact Explainer**: Generate human-readable impact explanations and recommendations
 - **Live DB Checker**: Compare migrations with actual PostgreSQL schema
 
 ## Installation
@@ -130,4 +131,4 @@ BLAST RADIUS ANALYZER - REPORT
 - [x] Step 5: Environment Variable Validation
 - [x] Step 6: Circular Dependency Detection
 - [x] Step 7: Git diff integration
-- [ ] Step 8: LLM Reasoner for impact explanation
+- [x] Step 8: Impact Explainer (LLM-ready)
