@@ -105,6 +105,13 @@ class EnvVarIssue:
 
 
 @dataclass
+class CircularDependency:
+    """Circular dependency in service graph."""
+    cycle: List[str]  # e.g., ['a', 'b', 'c', 'a']
+    details: str
+
+
+@dataclass
 class LiveDBColumn:
     """Column from live database."""
     name: str
@@ -134,6 +141,7 @@ class AnalysisResult:
     env_issues: List[EnvVarIssue] = field(default_factory=list)
     env_vars_defined: Dict[str, List[str]] = field(default_factory=dict)  # var -> [services]
     env_vars_used: Dict[str, List[str]] = field(default_factory=dict)  # var -> [files]
+    circular_deps: List[CircularDependency] = field(default_factory=list)
     live_db_tables: Dict[str, LiveDBTable] = field(default_factory=dict)
     dependency_graph: Dict[str, List[str]] = field(default_factory=dict)
 
@@ -1033,6 +1041,8 @@ class BlastRadiusAnalyzer:
         if docker_path.exists():
             result.services = self.docker_parser.parse(str(docker_path))
             result.dependency_graph = self._build_dependency_graph(result.services)
+            # Check for circular dependencies
+            result.circular_deps = self._detect_cycles(result.dependency_graph)
             # Check env var consistency
             result.env_vars_defined, result.env_vars_used, result.env_issues = self.env_checker.check(result.services)
 
@@ -1082,6 +1092,42 @@ class BlastRadiusAnalyzer:
             graph[name] = deps
         return graph
 
+    def _detect_cycles(self, graph: Dict[str, List[str]]) -> List[CircularDependency]:
+        """Detect circular dependencies using DFS."""
+        cycles = []
+        visited = set()
+        rec_stack = set()
+        path = []
+
+        def dfs(node: str) -> bool:
+            visited.add(node)
+            rec_stack.add(node)
+            path.append(node)
+
+            for neighbor in graph.get(node, []):
+                if neighbor not in visited:
+                    if dfs(neighbor):
+                        return True
+                elif neighbor in rec_stack:
+                    # Found cycle - extract it from path
+                    cycle_start = path.index(neighbor)
+                    cycle = path[cycle_start:] + [neighbor]
+                    cycles.append(CircularDependency(
+                        cycle=cycle,
+                        details=f"Circular dependency: {' -> '.join(cycle)}"
+                    ))
+                    return True
+
+            path.pop()
+            rec_stack.remove(node)
+            return False
+
+        for node in graph:
+            if node not in visited:
+                dfs(node)
+
+        return cycles
+
     def print_report(self, result: AnalysisResult):
         print("\n" + "=" * 60)
         print("BLAST RADIUS ANALYZER - REPORT")
@@ -1093,6 +1139,14 @@ class BlastRadiusAnalyzer:
             deps = ', '.join(svc.depends_on) or 'none'
             ports = ', '.join(str(p) for p in svc.ports) or 'none'
             print(f"  - {name}: ports={ports}, depends_on=[{deps}]")
+
+        # Circular Dependencies
+        if result.circular_deps:
+            print(f"\n[CIRCULAR DEPS] Found {len(result.circular_deps)} cycles:")
+            for cycle in result.circular_deps:
+                print(f"  [CRITICAL] {cycle.details}")
+        else:
+            print("\n[DEPS] No circular dependencies")
 
         # Database
         print(f"\n[DATABASE] Found {len(result.db_tables)} tables in migrations:")
@@ -1260,6 +1314,13 @@ def main():
                 }
                 for issue in result.env_issues
             ],
+            "circular_deps": [
+                {
+                    "cycle": cycle.cycle,
+                    "details": cycle.details
+                }
+                for cycle in result.circular_deps
+            ],
             "schema_drift": [
                 {
                     "table": drift.table,
@@ -1276,7 +1337,7 @@ def main():
     # Exit code based on issues
     critical_drift = [d for d in result.schema_drift if d.issue_type in ('missing_table', 'missing_column')]
     critical_fk = [f for f in result.fk_issues if f.issue_type in ('missing_target_table', 'wrong_order')]
-    has_issues = result.sync_issues or result.idempotency_issues or critical_drift or critical_fk
+    has_issues = result.sync_issues or result.idempotency_issues or critical_drift or critical_fk or result.circular_deps
     exit(1 if has_issues else 0)
 
 
