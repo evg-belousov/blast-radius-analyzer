@@ -747,11 +747,11 @@ class BlastRadiusAnalyzer:
                     by_type.setdefault(drift.issue_type, []).append(drift)
 
                 type_labels = {
-                    'missing_table': '🔴 MISSING TABLES (in migrations, not in DB)',
-                    'missing_column': '🔴 MISSING COLUMNS (in migrations, not in DB)',
-                    'extra_table': '🟡 EXTRA TABLES (in DB, not in migrations)',
-                    'extra_column': '🟡 EXTRA COLUMNS (in DB, not in migrations)',
-                    'type_mismatch': '🟠 TYPE MISMATCHES',
+                    'missing_table': '[CRITICAL] MISSING TABLES (in migrations, not in DB)',
+                    'missing_column': '[CRITICAL] MISSING COLUMNS (in migrations, not in DB)',
+                    'extra_table': '[WARNING] EXTRA TABLES (in DB, not in migrations)',
+                    'extra_column': '[WARNING] EXTRA COLUMNS (in DB, not in migrations)',
+                    'type_mismatch': '[INFO] TYPE MISMATCHES',
                 }
 
                 for issue_type, label in type_labels.items():
