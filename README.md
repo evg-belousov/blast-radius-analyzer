@@ -10,6 +10,7 @@ Static analysis tool to predict impact of code changes in multi-service systems.
 - **Sync Checker**: Detect mismatches between models and migrations
 - **Idempotency Checker**: Detect non-idempotent migration patterns
 - **FK Consistency Checker**: Validate foreign key references and migration order
+- **Env Var Checker**: Detect undefined/unused environment variables
 - **Live DB Checker**: Compare migrations with actual PostgreSQL schema
 
 ## Installation
@@ -89,6 +90,8 @@ BLAST RADIUS ANALYZER - REPORT
 | **Idempotency** | Migrations that can fail on retry | Warning |
 | **FK Missing Table** | FK references non-existent table | Critical |
 | **FK Wrong Order** | FK defined before target table created | Critical |
+| **Env Not Used** | Env var defined but not found in code | Warning |
+| **Env Not Defined** | Env var used but not in docker-compose | Info |
 | **Missing Table** | Table in migrations, not in DB | Critical |
 | **Missing Column** | Column in migrations, not in DB | Critical |
 | **Extra Table** | Table in DB, not in migrations | Warning |
@@ -116,7 +119,7 @@ BLAST RADIUS ANALYZER - REPORT
 - [x] Step 2: Idempotency Checker
 - [x] Step 3: Live Database Schema Comparison
 - [x] Step 4: Foreign Key Consistency Check
-- [ ] Step 5: Environment Variable Validation
+- [x] Step 5: Environment Variable Validation
 - [ ] Step 6: Circular Dependency Detection
 - [ ] Step 7: Git diff integration
 - [ ] Step 8: LLM Reasoner for impact explanation

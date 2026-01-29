@@ -95,6 +95,16 @@ class ForeignKeyIssue:
 
 
 @dataclass
+class EnvVarIssue:
+    """Environment variable issue."""
+    issue_type: str  # 'defined_not_used', 'used_not_defined'
+    var_name: str
+    service: Optional[str]  # Service where defined (if applicable)
+    used_in: List[str]  # Files where used
+    details: str
+
+
+@dataclass
 class LiveDBColumn:
     """Column from live database."""
     name: str
@@ -121,6 +131,9 @@ class AnalysisResult:
     schema_drift: List[SchemaDrift] = field(default_factory=list)
     fk_issues: List[ForeignKeyIssue] = field(default_factory=list)
     foreign_keys: List[ForeignKeyDef] = field(default_factory=list)
+    env_issues: List[EnvVarIssue] = field(default_factory=list)
+    env_vars_defined: Dict[str, List[str]] = field(default_factory=dict)  # var -> [services]
+    env_vars_used: Dict[str, List[str]] = field(default_factory=dict)  # var -> [files]
     live_db_tables: Dict[str, LiveDBTable] = field(default_factory=dict)
     dependency_graph: Dict[str, List[str]] = field(default_factory=dict)
 
@@ -697,6 +710,126 @@ class ForeignKeyChecker:
 
 
 # ============================================================================
+# Environment Variable Checker
+# ============================================================================
+
+class EnvVarChecker:
+    """Check environment variable consistency.
+
+    Detects:
+    - Variables defined in docker-compose but not used in code
+    - Variables used in code but not defined in docker-compose
+    """
+
+    # Patterns to search for env var usage in code
+    ENV_PATTERNS = [
+        r"os\.environ\.get\s*\(\s*['\"](\w+)['\"]",  # os.environ.get('VAR')
+        r"os\.environ\s*\[\s*['\"](\w+)['\"]\s*\]",  # os.environ['VAR']
+        r"os\.getenv\s*\(\s*['\"](\w+)['\"]",  # os.getenv('VAR')
+        r"process\.env\.(\w+)",  # process.env.VAR (Node.js)
+        r"import\.meta\.env\.(\w+)",  # import.meta.env.VAR (Vite)
+        r"\$\{(\w+)\}",  # ${VAR} in shell/config
+        r"\$(\w+)",  # $VAR in shell (careful with false positives)
+    ]
+
+    # Common system/framework vars to ignore
+    IGNORE_VARS = {
+        'PATH', 'HOME', 'USER', 'SHELL', 'PWD', 'LANG', 'TERM',
+        'NODE_ENV', 'MODE', 'DEV', 'PROD', 'BASE_URL', 'SSR',
+        'CI', 'DEBUG', 'VERBOSE', 'PYTHONPATH', 'PYTHONDONTWRITEBYTECODE',
+        'TZ', 'LC_ALL', 'LC_CTYPE', 'HOSTNAME', 'TMPDIR',
+    }
+
+    # File extensions to search
+    CODE_EXTENSIONS = {'.py', '.js', '.ts', '.jsx', '.tsx', '.sh', '.yaml', '.yml', '.env.example'}
+
+    def __init__(self, project_root: Path):
+        self.project_root = project_root
+
+    def check(self, services: Dict[str, ServiceNode]) -> tuple:
+        """Check env var consistency.
+
+        Returns:
+            tuple: (env_vars_defined, env_vars_used, issues)
+        """
+        # Collect defined vars from docker-compose
+        defined = {}  # var_name -> [services]
+        for service_name, service in services.items():
+            for var_name in service.environment.keys():
+                if var_name not in self.IGNORE_VARS:
+                    defined.setdefault(var_name, []).append(service_name)
+
+        # Search for used vars in code
+        used = self._find_used_vars()
+
+        # Find issues
+        issues = []
+
+        # Vars defined but not used (warning - might be used at runtime)
+        for var_name, services_list in defined.items():
+            if var_name not in used and not var_name.startswith('_'):
+                issues.append(EnvVarIssue(
+                    issue_type='defined_not_used',
+                    var_name=var_name,
+                    service=', '.join(services_list),
+                    used_in=[],
+                    details=f"'{var_name}' defined in docker-compose ({', '.join(services_list)}) but not found in code"
+                ))
+
+        # Vars used but not defined (could be critical)
+        for var_name, files in used.items():
+            if var_name not in defined and var_name not in self.IGNORE_VARS:
+                # Check if it's a VITE_ var (should be defined)
+                if var_name.startswith(('VITE_', 'REACT_APP_', 'NEXT_PUBLIC_')):
+                    issues.append(EnvVarIssue(
+                        issue_type='used_not_defined',
+                        var_name=var_name,
+                        service=None,
+                        used_in=files[:3],  # Limit to 3 files
+                        details=f"'{var_name}' used in code but not defined in docker-compose"
+                    ))
+
+        return defined, used, issues
+
+    def _find_used_vars(self) -> Dict[str, List[str]]:
+        """Find all env vars used in code."""
+        used = {}  # var_name -> [files]
+
+        for ext in self.CODE_EXTENSIONS:
+            for filepath in self.project_root.rglob(f'*{ext}'):
+                # Skip node_modules, venv, etc
+                path_str = str(filepath)
+                if any(skip in path_str for skip in ['node_modules', 'venv', '.venv', '__pycache__', '.git', 'dist', 'build']):
+                    continue
+
+                try:
+                    content = filepath.read_text(encoding='utf-8', errors='ignore')
+                    vars_in_file = self._extract_vars(content)
+
+                    for var_name in vars_in_file:
+                        if var_name not in self.IGNORE_VARS:
+                            rel_path = str(filepath.relative_to(self.project_root))
+                            used.setdefault(var_name, []).append(rel_path)
+                except Exception:
+                    continue
+
+        return used
+
+    def _extract_vars(self, content: str) -> set:
+        """Extract env var names from content."""
+        vars_found = set()
+
+        for pattern in self.ENV_PATTERNS:
+            for match in re.finditer(pattern, content):
+                var_name = match.group(1)
+                # Filter out obvious non-env vars
+                if var_name.isupper() or var_name.startswith(('VITE_', 'REACT_', 'NEXT_', 'DATABASE', 'DB_', 'API_', 'SECRET', 'AWS_', 'REDIS_')):
+                    vars_found.add(var_name)
+
+        return vars_found
+
+
+# ============================================================================
 # Live Database Checker
 # ============================================================================
 
@@ -889,6 +1022,7 @@ class BlastRadiusAnalyzer:
         self.sync_checker = SyncChecker()
         self.idempotency_checker = IdempotencyChecker()
         self.fk_checker = ForeignKeyChecker()
+        self.env_checker = EnvVarChecker(self.project_root)
         self.live_schema_checker = LiveSchemaChecker(db_url) if db_url else None
 
     def analyze(self, profile: dict) -> AnalysisResult:
@@ -899,6 +1033,8 @@ class BlastRadiusAnalyzer:
         if docker_path.exists():
             result.services = self.docker_parser.parse(str(docker_path))
             result.dependency_graph = self._build_dependency_graph(result.services)
+            # Check env var consistency
+            result.env_vars_defined, result.env_vars_used, result.env_issues = self.env_checker.check(result.services)
 
         # 2. Migrations
         migrations_dir = self.project_root / 'alembic' / 'versions'
@@ -995,6 +1131,19 @@ class BlastRadiusAnalyzer:
                     print(f"           File: {issue.migration_file}")
             else:
                 print("[FK] All foreign keys are consistent")
+
+        # Environment Variables
+        if result.env_vars_defined or result.env_vars_used:
+            print(f"\n[ENV VARS] {len(result.env_vars_defined)} defined, {len(result.env_vars_used)} used in code")
+            if result.env_issues:
+                print(f"\n[ENV ISSUES] Found {len(result.env_issues)} issues:")
+                for issue in result.env_issues:
+                    severity = "[WARNING]" if issue.issue_type == 'defined_not_used' else "[INFO]"
+                    print(f"  {severity} {issue.details}")
+                    if issue.used_in:
+                        print(f"           Used in: {', '.join(issue.used_in)}")
+            else:
+                print("[ENV] All env vars are consistent")
 
         # Schema Drift (Live DB)
         if result.live_db_tables:
@@ -1098,6 +1247,18 @@ def main():
                     "file": issue.migration_file
                 }
                 for issue in result.fk_issues
+            ],
+            "env_vars_defined": len(result.env_vars_defined),
+            "env_vars_used": len(result.env_vars_used),
+            "env_issues": [
+                {
+                    "issue_type": issue.issue_type,
+                    "var_name": issue.var_name,
+                    "service": issue.service,
+                    "used_in": issue.used_in,
+                    "details": issue.details
+                }
+                for issue in result.env_issues
             ],
             "schema_drift": [
                 {
