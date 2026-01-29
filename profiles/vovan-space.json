@@ -1,0 +1,12 @@
+{
+  "project_name": "vovan-space",
+  "tech_stack": ["python", "nodejs", "react"],
+  "db_engine": "postgresql",
+  "entry_points": {
+    "launcher": "./space_launcher.py",
+    "zoo_galaxy": "./projects/zoo-galaxy"
+  },
+  "infrastructure": "docker-compose.yml",
+  "models_path": "app/models.py",
+  "migrations_path": "alembic/versions"
+}
