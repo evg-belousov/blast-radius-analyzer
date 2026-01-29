@@ -112,6 +112,25 @@ class CircularDependency:
 
 
 @dataclass
+class GitChange:
+    """A changed file from git diff."""
+    path: str
+    change_type: str  # 'added', 'modified', 'deleted'
+    affected_services: List[str]
+    affected_tables: List[str]
+
+
+@dataclass
+class ImpactAnalysis:
+    """Impact analysis from git changes."""
+    changed_files: List[GitChange]
+    affected_services: set
+    affected_tables: set
+    risk_level: str  # 'low', 'medium', 'high', 'critical'
+    summary: str
+
+
+@dataclass
 class LiveDBColumn:
     """Column from live database."""
     name: str
@@ -142,6 +161,7 @@ class AnalysisResult:
     env_vars_defined: Dict[str, List[str]] = field(default_factory=dict)  # var -> [services]
     env_vars_used: Dict[str, List[str]] = field(default_factory=dict)  # var -> [files]
     circular_deps: List[CircularDependency] = field(default_factory=list)
+    impact_analysis: Optional[ImpactAnalysis] = None
     live_db_tables: Dict[str, LiveDBTable] = field(default_factory=dict)
     dependency_graph: Dict[str, List[str]] = field(default_factory=dict)
 
@@ -838,6 +858,186 @@ class EnvVarChecker:
 
 
 # ============================================================================
+# Git Diff Analyzer
+# ============================================================================
+
+class GitDiffAnalyzer:
+    """Analyze git diff to determine change impact.
+
+    Maps changed files to affected services and database tables.
+    """
+
+    # Patterns to identify service ownership
+    SERVICE_PATTERNS = {
+        'launcher': [r'^space_launcher\.py', r'^app/', r'^alembic/'],
+        'zoo-galaxy-backend': [r'^projects/zoo-galaxy/src/backend/'],
+        'zoo-galaxy-frontend': [r'^projects/zoo-galaxy/src/frontend/'],
+        'earth-globe-backend': [r'^projects/earth-globe/src/backend/'],
+        'earth-globe-frontend': [r'^projects/earth-globe/src/frontend/'],
+        'solar-system-backend': [r'^projects/solar-system/src/backend/'],
+        'solar-system-frontend': [r'^projects/solar-system/src/frontend/'],
+    }
+
+    # Patterns to identify affected tables
+    TABLE_PATTERNS = {
+        'users': [r'users?\.py', r'user', r'auth'],
+        'sessions': [r'sessions?\.py', r'session', r'auth', r'login'],
+        'tasks': [r'tasks?\.py', r'task', r'quiz'],
+        'achievements': [r'achievements?\.py', r'achievement'],
+        'activity_log': [r'activity', r'log'],
+    }
+
+    def __init__(self, project_root: Path):
+        self.project_root = project_root
+
+    def analyze_diff(self, base_ref: str = 'HEAD~1', target_ref: str = 'HEAD') -> Optional[ImpactAnalysis]:
+        """Analyze git diff between two refs."""
+        import subprocess
+
+        try:
+            # Get changed files
+            result = subprocess.run(
+                ['git', 'diff', '--name-status', base_ref, target_ref],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode != 0:
+                return None
+
+            changes = []
+            affected_services = set()
+            affected_tables = set()
+
+            for line in result.stdout.strip().split('\n'):
+                if not line:
+                    continue
+
+                parts = line.split('\t')
+                if len(parts) < 2:
+                    continue
+
+                change_type_code = parts[0]
+                file_path = parts[-1]  # Handle renames (R100 old new)
+
+                change_type = {
+                    'A': 'added',
+                    'M': 'modified',
+                    'D': 'deleted',
+                    'R': 'renamed',
+                }.get(change_type_code[0], 'modified')
+
+                # Determine affected services
+                file_services = self._get_affected_services(file_path)
+                affected_services.update(file_services)
+
+                # Determine affected tables
+                file_tables = self._get_affected_tables(file_path)
+                affected_tables.update(file_tables)
+
+                changes.append(GitChange(
+                    path=file_path,
+                    change_type=change_type,
+                    affected_services=file_services,
+                    affected_tables=file_tables
+                ))
+
+            # Determine risk level
+            risk_level = self._calculate_risk(changes, affected_services, affected_tables)
+
+            # Generate summary
+            summary = self._generate_summary(changes, affected_services, affected_tables, risk_level)
+
+            return ImpactAnalysis(
+                changed_files=changes,
+                affected_services=affected_services,
+                affected_tables=affected_tables,
+                risk_level=risk_level,
+                summary=summary
+            )
+
+        except Exception as e:
+            return None
+
+    def _get_affected_services(self, file_path: str) -> List[str]:
+        """Determine which services are affected by a file change."""
+        services = []
+        for service, patterns in self.SERVICE_PATTERNS.items():
+            for pattern in patterns:
+                if re.search(pattern, file_path):
+                    services.append(service)
+                    break
+        return services
+
+    def _get_affected_tables(self, file_path: str) -> List[str]:
+        """Determine which tables might be affected by a file change."""
+        tables = []
+
+        # Check if it's a migration file
+        if 'alembic' in file_path or 'migration' in file_path.lower():
+            # Read the file content to find table references
+            try:
+                full_path = self.project_root / file_path
+                if full_path.exists():
+                    content = full_path.read_text(encoding='utf-8')
+                    for table_name in self.TABLE_PATTERNS.keys():
+                        if table_name in content.lower():
+                            tables.append(table_name)
+            except Exception:
+                pass
+        else:
+            # Use pattern matching
+            file_lower = file_path.lower()
+            for table, patterns in self.TABLE_PATTERNS.items():
+                for pattern in patterns:
+                    if re.search(pattern, file_lower):
+                        tables.append(table)
+                        break
+
+        return tables
+
+    def _calculate_risk(
+        self,
+        changes: List[GitChange],
+        services: set,
+        tables: set
+    ) -> str:
+        """Calculate overall risk level."""
+        # Critical: migration changes, multiple services, core tables
+        migration_changes = any('alembic' in c.path or 'migration' in c.path for c in changes)
+        core_tables = {'users', 'sessions'}.intersection(tables)
+
+        if migration_changes and core_tables:
+            return 'critical'
+        if migration_changes or len(services) > 3:
+            return 'high'
+        if len(services) > 1 or tables:
+            return 'medium'
+        return 'low'
+
+    def _generate_summary(
+        self,
+        changes: List[GitChange],
+        services: set,
+        tables: set,
+        risk_level: str
+    ) -> str:
+        """Generate human-readable impact summary."""
+        parts = [f"{len(changes)} files changed"]
+
+        if services:
+            parts.append(f"affecting {len(services)} services ({', '.join(sorted(services))})")
+
+        if tables:
+            parts.append(f"touching {len(tables)} tables ({', '.join(sorted(tables))})")
+
+        parts.append(f"risk: {risk_level.upper()}")
+
+        return "; ".join(parts)
+
+
+# ============================================================================
 # Live Database Checker
 # ============================================================================
 
@@ -1021,9 +1221,10 @@ class LiveSchemaChecker:
 class BlastRadiusAnalyzer:
     """Main analyzer combining all parsers."""
 
-    def __init__(self, project_root: str, db_url: Optional[str] = None):
+    def __init__(self, project_root: str, db_url: Optional[str] = None, diff_base: Optional[str] = None):
         self.project_root = Path(project_root)
         self.db_url = db_url
+        self.diff_base = diff_base
         self.docker_parser = DockerComposeParser()
         self.migration_parser = MigrationParser()
         self.model_parser = SQLAlchemyModelParser()
@@ -1031,6 +1232,7 @@ class BlastRadiusAnalyzer:
         self.idempotency_checker = IdempotencyChecker()
         self.fk_checker = ForeignKeyChecker()
         self.env_checker = EnvVarChecker(self.project_root)
+        self.git_analyzer = GitDiffAnalyzer(self.project_root)
         self.live_schema_checker = LiveSchemaChecker(db_url) if db_url else None
 
     def analyze(self, profile: dict) -> AnalysisResult:
@@ -1075,6 +1277,10 @@ class BlastRadiusAnalyzer:
                 )
             finally:
                 self.live_schema_checker.close()
+
+        # 6. Git diff analysis
+        if self.diff_base:
+            result.impact_analysis = self.git_analyzer.analyze_diff(self.diff_base, 'HEAD')
 
         return result
 
@@ -1199,6 +1405,26 @@ class BlastRadiusAnalyzer:
             else:
                 print("[ENV] All env vars are consistent")
 
+        # Git Diff Impact Analysis
+        if result.impact_analysis:
+            impact = result.impact_analysis
+            risk_colors = {
+                'low': '',
+                'medium': '[WARNING]',
+                'high': '[WARNING]',
+                'critical': '[CRITICAL]'
+            }
+            print(f"\n[GIT DIFF] {impact.summary}")
+            print(f"  {risk_colors.get(impact.risk_level, '')} Risk level: {impact.risk_level.upper()}")
+            if impact.affected_services:
+                print(f"  Affected services: {', '.join(sorted(impact.affected_services))}")
+            if impact.affected_tables:
+                print(f"  Affected tables: {', '.join(sorted(impact.affected_tables))}")
+            if len(impact.changed_files) <= 10:
+                print(f"  Changed files:")
+                for change in impact.changed_files:
+                    print(f"    [{change.change_type[0].upper()}] {change.path}")
+
         # Schema Drift (Live DB)
         if result.live_db_tables:
             print(f"\n[LIVE DB] Connected, found {len(result.live_db_tables)} tables")
@@ -1256,6 +1482,10 @@ def main():
         action='store_true',
         help='Output as JSON'
     )
+    parser.add_argument(
+        '--diff',
+        help='Analyze git diff from specified ref (e.g., HEAD~1, main, origin/main)'
+    )
 
     args = parser.parse_args()
 
@@ -1272,7 +1502,7 @@ def main():
         with open(args.profile, 'r') as f:
             profile = json.load(f)
 
-    analyzer = BlastRadiusAnalyzer(args.project, db_url=db_url)
+    analyzer = BlastRadiusAnalyzer(args.project, db_url=db_url, diff_base=args.diff)
     result = analyzer.analyze(profile)
 
     if args.json:
@@ -1321,6 +1551,13 @@ def main():
                 }
                 for cycle in result.circular_deps
             ],
+            "impact_analysis": {
+                "changed_files": len(result.impact_analysis.changed_files) if result.impact_analysis else 0,
+                "affected_services": list(result.impact_analysis.affected_services) if result.impact_analysis else [],
+                "affected_tables": list(result.impact_analysis.affected_tables) if result.impact_analysis else [],
+                "risk_level": result.impact_analysis.risk_level if result.impact_analysis else None,
+                "summary": result.impact_analysis.summary if result.impact_analysis else None
+            } if result.impact_analysis else None,
             "schema_drift": [
                 {
                     "table": drift.table,
@@ -1337,7 +1574,8 @@ def main():
     # Exit code based on issues
     critical_drift = [d for d in result.schema_drift if d.issue_type in ('missing_table', 'missing_column')]
     critical_fk = [f for f in result.fk_issues if f.issue_type in ('missing_target_table', 'wrong_order')]
-    has_issues = result.sync_issues or result.idempotency_issues or critical_drift or critical_fk or result.circular_deps
+    high_risk_diff = result.impact_analysis and result.impact_analysis.risk_level in ('high', 'critical')
+    has_issues = result.sync_issues or result.idempotency_issues or critical_drift or critical_fk or result.circular_deps or high_risk_diff
     exit(1 if has_issues else 0)
 
 

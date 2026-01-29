@@ -12,6 +12,7 @@ Static analysis tool to predict impact of code changes in multi-service systems.
 - **FK Consistency Checker**: Validate foreign key references and migration order
 - **Env Var Checker**: Detect undefined/unused environment variables
 - **Circular Dependency Detector**: Find cycles in service depends_on graph
+- **Git Diff Analyzer**: Map changed files to affected services and tables
 - **Live DB Checker**: Compare migrations with actual PostgreSQL schema
 
 ## Installation
@@ -35,6 +36,10 @@ python impact_analyzer.py -p /path/to/project
 
 # JSON output
 python impact_analyzer.py -p /path/to/project --json
+
+# Analyze git diff impact
+python impact_analyzer.py -p /path/to/project --diff HEAD~1
+python impact_analyzer.py -p /path/to/project --diff main
 
 # With custom profile
 python impact_analyzer.py -p /path/to/project --profile profiles/custom.json
@@ -94,6 +99,7 @@ BLAST RADIUS ANALYZER - REPORT
 | **Env Not Used** | Env var defined but not found in code | Warning |
 | **Env Not Defined** | Env var used but not in docker-compose | Info |
 | **Circular Deps** | Service A -> B -> C -> A dependency cycle | Critical |
+| **High Risk Diff** | Git changes touch migrations + core tables | Critical |
 | **Missing Table** | Table in migrations, not in DB | Critical |
 | **Missing Column** | Column in migrations, not in DB | Critical |
 | **Extra Table** | Table in DB, not in migrations | Warning |
@@ -123,5 +129,5 @@ BLAST RADIUS ANALYZER - REPORT
 - [x] Step 4: Foreign Key Consistency Check
 - [x] Step 5: Environment Variable Validation
 - [x] Step 6: Circular Dependency Detection
-- [ ] Step 7: Git diff integration
+- [x] Step 7: Git diff integration
 - [ ] Step 8: LLM Reasoner for impact explanation
