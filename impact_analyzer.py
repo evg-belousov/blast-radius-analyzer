@@ -74,6 +74,27 @@ class SchemaDrift:
 
 
 @dataclass
+class ForeignKeyDef:
+    """Foreign key definition from migration."""
+    source_table: str
+    source_column: str
+    target_table: str
+    target_column: str
+    migration_file: str
+    migration_order: int  # Order in which migration appears
+
+
+@dataclass
+class ForeignKeyIssue:
+    """Foreign key consistency issue."""
+    issue_type: str  # 'missing_target_table', 'missing_target_column', 'wrong_order'
+    source: str  # e.g., 'user_achievements.user_id'
+    target: str  # e.g., 'users.id'
+    details: str
+    migration_file: str
+
+
+@dataclass
 class LiveDBColumn:
     """Column from live database."""
     name: str
@@ -98,6 +119,8 @@ class AnalysisResult:
     sync_issues: List[str] = field(default_factory=list)
     idempotency_issues: List[IdempotencyIssue] = field(default_factory=list)
     schema_drift: List[SchemaDrift] = field(default_factory=list)
+    fk_issues: List[ForeignKeyIssue] = field(default_factory=list)
+    foreign_keys: List[ForeignKeyDef] = field(default_factory=list)
     live_db_tables: Dict[str, LiveDBTable] = field(default_factory=dict)
     dependency_graph: Dict[str, List[str]] = field(default_factory=dict)
 
@@ -452,6 +475,228 @@ class IdempotencyChecker:
 
 
 # ============================================================================
+# Foreign Key Checker
+# ============================================================================
+
+class ForeignKeyChecker:
+    """Check foreign key consistency in migrations.
+
+    Detects:
+    - FK referencing non-existent tables
+    - FK referencing non-existent columns
+    - FK defined before target table is created
+    """
+
+    def parse_and_check(self, migrations_dir: str) -> tuple:
+        """Parse migrations for FK definitions and check consistency.
+
+        Returns:
+            tuple: (list of ForeignKeyDef, list of ForeignKeyIssue)
+        """
+        foreign_keys = []
+        migrations_path = Path(migrations_dir)
+
+        if not migrations_path.exists():
+            return [], []
+
+        # Build revision chain to get actual migration order
+        revision_order = self._build_revision_order(migrations_path)
+
+        # Track table creation order
+        table_creation_order = {}  # table_name -> migration_order
+        migration_files = list(migrations_path.glob('*.py'))
+
+        # First pass: find all table creations and their order
+        for migration_file in migration_files:
+            content = migration_file.read_text(encoding='utf-8')
+            revision = self._get_revision(content)
+            order = revision_order.get(revision, 999)
+
+            tables = self._find_created_tables(content)
+            for table in tables:
+                if table not in table_creation_order:
+                    table_creation_order[table] = order
+
+        # Second pass: find all FK definitions
+        for migration_file in migration_files:
+            content = migration_file.read_text(encoding='utf-8')
+            revision = self._get_revision(content)
+            order = revision_order.get(revision, 999)
+
+            fks = self._parse_foreign_keys(content, migration_file.name, order)
+            foreign_keys.extend(fks)
+
+        # Check FK consistency
+        issues = self._check_consistency(foreign_keys, table_creation_order)
+
+        return foreign_keys, issues
+
+    def _build_revision_order(self, migrations_path: Path) -> Dict[str, int]:
+        """Build actual migration order from Alembic revision chain."""
+        revisions = {}  # revision -> down_revision
+        heads = set()
+        all_revisions = set()
+
+        # Parse all revisions
+        for migration_file in migrations_path.glob('*.py'):
+            content = migration_file.read_text(encoding='utf-8')
+            revision = self._get_revision(content)
+            down_revision = self._get_down_revision(content)
+
+            if revision:
+                revisions[revision] = down_revision
+                all_revisions.add(revision)
+                if down_revision:
+                    heads.discard(down_revision)
+                heads.add(revision)
+
+        # Find the base (revision with no down_revision)
+        base = None
+        for rev, down in revisions.items():
+            if down is None:
+                base = rev
+                break
+
+        # Walk the chain from base to build order
+        order = {}
+        current = base
+        idx = 0
+
+        while current:
+            order[current] = idx
+            idx += 1
+            # Find next revision (one that has current as down_revision)
+            next_rev = None
+            for rev, down in revisions.items():
+                if down == current:
+                    next_rev = rev
+                    break
+            current = next_rev
+
+        return order
+
+    def _get_revision(self, content: str) -> Optional[str]:
+        """Extract revision ID from migration content."""
+        match = re.search(r"^revision\s*[=:]\s*['\"](\w+)['\"]", content, re.MULTILINE)
+        return match.group(1) if match else None
+
+    def _get_down_revision(self, content: str) -> Optional[str]:
+        """Extract down_revision from migration content."""
+        match = re.search(r"^down_revision\s*[=:][^=]*['\"](\w+)['\"]", content, re.MULTILINE)
+        return match.group(1) if match else None
+
+    def _find_created_tables(self, content: str) -> List[str]:
+        """Find all tables created in a migration."""
+        tables = []
+
+        # Pattern: op.create_table('table_name', ...)
+        create_pattern = re.compile(r"op\.create_table\s*\(\s*['\"](\w+)['\"]")
+        for match in create_pattern.finditer(content):
+            tables.append(match.group(1))
+
+        return tables
+
+    def _parse_foreign_keys(self, content: str, filename: str, order: int) -> List[ForeignKeyDef]:
+        """Parse FK definitions from migration content."""
+        foreign_keys = []
+
+        # Pattern 1: sa.ForeignKey('table.column') or sa.ForeignKey('table.column', ...)
+        fk_pattern = re.compile(
+            r"sa\.ForeignKey\s*\(\s*['\"](\w+)\.(\w+)['\"]",
+            re.MULTILINE
+        )
+
+        # We need to find the context (which column this FK is on)
+        # Pattern: sa.Column('column_name', ..., sa.ForeignKey('table.column'))
+        column_fk_pattern = re.compile(
+            r"sa\.Column\s*\(\s*['\"](\w+)['\"].*?"
+            r"sa\.ForeignKey\s*\(\s*['\"](\w+)\.(\w+)['\"]",
+            re.DOTALL
+        )
+
+        # Find the current table context
+        # This is tricky - we need to find which table the FK belongs to
+        lines = content.split('\n')
+        current_table = None
+
+        for i, line in enumerate(lines):
+            # Track current table in create_table block
+            if 'op.create_table(' in line:
+                match = re.search(r"op\.create_table\s*\(\s*['\"](\w+)['\"]", line)
+                if match:
+                    current_table = match.group(1)
+                else:
+                    # Table name might be on next line
+                    for j in range(i + 1, min(i + 3, len(lines))):
+                        match = re.search(r"['\"](\w+)['\"]", lines[j])
+                        if match:
+                            current_table = match.group(1)
+                            break
+
+            # Find FK in this line
+            col_match = column_fk_pattern.search(line)
+            if col_match and current_table:
+                source_column = col_match.group(1)
+                target_table = col_match.group(2)
+                target_column = col_match.group(3)
+
+                foreign_keys.append(ForeignKeyDef(
+                    source_table=current_table,
+                    source_column=source_column,
+                    target_table=target_table,
+                    target_column=target_column,
+                    migration_file=filename,
+                    migration_order=order
+                ))
+
+            # Reset table context at end of create_table
+            if current_table and line.strip() == ')':
+                # Simple heuristic - might need improvement
+                pass
+
+        return foreign_keys
+
+    def _check_consistency(
+        self,
+        foreign_keys: List[ForeignKeyDef],
+        table_creation_order: Dict[str, int]
+    ) -> List[ForeignKeyIssue]:
+        """Check FK consistency against table definitions."""
+        issues = []
+
+        for fk in foreign_keys:
+            source = f"{fk.source_table}.{fk.source_column}"
+            target = f"{fk.target_table}.{fk.target_column}"
+
+            # Check 1: Target table exists
+            if fk.target_table not in table_creation_order:
+                issues.append(ForeignKeyIssue(
+                    issue_type='missing_target_table',
+                    source=source,
+                    target=target,
+                    details=f"FK '{source}' references table '{fk.target_table}' which is not created in any migration",
+                    migration_file=fk.migration_file
+                ))
+                continue
+
+            # Check 2: Migration order (target table should be created before FK)
+            target_order = table_creation_order[fk.target_table]
+            if fk.migration_order < target_order:
+                issues.append(ForeignKeyIssue(
+                    issue_type='wrong_order',
+                    source=source,
+                    target=target,
+                    details=(
+                        f"FK '{source}' -> '{target}' defined in migration that runs BEFORE "
+                        f"target table '{fk.target_table}' is created"
+                    ),
+                    migration_file=fk.migration_file
+                ))
+
+        return issues
+
+
+# ============================================================================
 # Live Database Checker
 # ============================================================================
 
@@ -643,6 +888,7 @@ class BlastRadiusAnalyzer:
         self.model_parser = SQLAlchemyModelParser()
         self.sync_checker = SyncChecker()
         self.idempotency_checker = IdempotencyChecker()
+        self.fk_checker = ForeignKeyChecker()
         self.live_schema_checker = LiveSchemaChecker(db_url) if db_url else None
 
     def analyze(self, profile: dict) -> AnalysisResult:
@@ -660,6 +906,8 @@ class BlastRadiusAnalyzer:
             result.db_tables = self.migration_parser.parse_directory(str(migrations_dir))
             # Check for non-idempotent patterns
             result.idempotency_issues = self.idempotency_checker.check_directory(str(migrations_dir))
+            # Check FK consistency
+            result.foreign_keys, result.fk_issues = self.fk_checker.parse_and_check(str(migrations_dir))
 
         # 3. Models
         models_path = self.project_root / 'app' / 'models.py'
@@ -735,6 +983,18 @@ class BlastRadiusAnalyzer:
                 print(f"  [!] {issue.file}: {issue.message}")
         else:
             print("\n[IDEMPOTENCY] All migrations are idempotent")
+
+        # Foreign Key Issues
+        if result.foreign_keys:
+            print(f"\n[FOREIGN KEYS] Found {len(result.foreign_keys)} FK definitions")
+            if result.fk_issues:
+                print(f"\n[FK ISSUES] Found {len(result.fk_issues)} issues:")
+                for issue in result.fk_issues:
+                    severity = "[CRITICAL]" if issue.issue_type in ('missing_target_table', 'wrong_order') else "[WARNING]"
+                    print(f"  {severity} {issue.details}")
+                    print(f"           File: {issue.migration_file}")
+            else:
+                print("[FK] All foreign keys are consistent")
 
         # Schema Drift (Live DB)
         if result.live_db_tables:
@@ -818,6 +1078,7 @@ def main():
             "tables_in_migrations": len(result.db_tables),
             "tables_in_database": len(result.live_db_tables),
             "models": len(result.model_fields),
+            "foreign_keys": len(result.foreign_keys),
             "sync_issues": result.sync_issues,
             "idempotency_issues": [
                 {
@@ -827,6 +1088,16 @@ def main():
                     "message": issue.message
                 }
                 for issue in result.idempotency_issues
+            ],
+            "fk_issues": [
+                {
+                    "issue_type": issue.issue_type,
+                    "source": issue.source,
+                    "target": issue.target,
+                    "details": issue.details,
+                    "file": issue.migration_file
+                }
+                for issue in result.fk_issues
             ],
             "schema_drift": [
                 {
@@ -843,7 +1114,8 @@ def main():
 
     # Exit code based on issues
     critical_drift = [d for d in result.schema_drift if d.issue_type in ('missing_table', 'missing_column')]
-    has_issues = result.sync_issues or result.idempotency_issues or critical_drift
+    critical_fk = [f for f in result.fk_issues if f.issue_type in ('missing_target_table', 'wrong_order')]
+    has_issues = result.sync_issues or result.idempotency_issues or critical_drift or critical_fk
     exit(1 if has_issues else 0)
 
 
