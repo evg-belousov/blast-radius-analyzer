@@ -402,13 +402,23 @@ class IdempotencyChecker:
         # Look for else block and column_exists checks
         search_content = content[after_pos:]
 
-        # Pattern for column_exists check: column_exists('table', 'column')
+        # Pattern 1: column_exists('table', 'column')
         col_exists_pattern = re.compile(
             rf"column_exists\s*\(\s*['\"]({re.escape(table_name)})['\"],\s*['\"](\w+)['\"]",
             re.MULTILINE
         )
 
         for match in col_exists_pattern.finditer(search_content):
+            if match.group(1) == table_name:
+                protected_columns.append(match.group(2))
+
+        # Pattern 2: ensure_column('table', 'column', ...) - helper function pattern
+        ensure_col_pattern = re.compile(
+            rf"ensure_column\s*\(\s*['\"]({re.escape(table_name)})['\"],\s*['\"](\w+)['\"]",
+            re.MULTILINE
+        )
+
+        for match in ensure_col_pattern.finditer(search_content):
             if match.group(1) == table_name:
                 protected_columns.append(match.group(2))
 
