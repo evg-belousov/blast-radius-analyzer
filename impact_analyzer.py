@@ -66,6 +66,30 @@ class IdempotencyIssue:
 
 
 @dataclass
+class SchemaDrift:
+    """Schema drift between migrations and live database."""
+    table: str
+    issue_type: str  # 'missing_table', 'extra_table', 'missing_column', 'extra_column', 'type_mismatch'
+    details: str
+
+
+@dataclass
+class LiveDBColumn:
+    """Column from live database."""
+    name: str
+    data_type: str
+    is_nullable: bool
+    column_default: Optional[str] = None
+
+
+@dataclass
+class LiveDBTable:
+    """Table from live database."""
+    name: str
+    columns: Dict[str, LiveDBColumn] = field(default_factory=dict)
+
+
+@dataclass
 class AnalysisResult:
     """Complete analysis result."""
     services: Dict[str, ServiceNode] = field(default_factory=dict)
@@ -73,6 +97,8 @@ class AnalysisResult:
     model_fields: Dict[str, Dict[str, ModelField]] = field(default_factory=dict)
     sync_issues: List[str] = field(default_factory=list)
     idempotency_issues: List[IdempotencyIssue] = field(default_factory=list)
+    schema_drift: List[SchemaDrift] = field(default_factory=list)
+    live_db_tables: Dict[str, LiveDBTable] = field(default_factory=dict)
     dependency_graph: Dict[str, List[str]] = field(default_factory=dict)
 
 
@@ -426,19 +452,198 @@ class IdempotencyChecker:
 
 
 # ============================================================================
+# Live Database Checker
+# ============================================================================
+
+class LiveSchemaChecker:
+    """Check live database schema against migrations.
+
+    Connects to PostgreSQL and compares actual schema with what
+    migrations define. Detects drift caused by:
+    - Manual DB changes
+    - Failed/partial migrations
+    - Missing migrations
+    """
+
+    # Map PostgreSQL types to SQLAlchemy type names
+    PG_TYPE_MAP = {
+        'integer': 'Integer',
+        'bigint': 'BigInteger',
+        'smallint': 'SmallInteger',
+        'character varying': 'String',
+        'varchar': 'String',
+        'text': 'Text',
+        'boolean': 'Boolean',
+        'timestamp without time zone': 'DateTime',
+        'timestamp with time zone': 'DateTime',
+        'date': 'Date',
+        'json': 'JSON',
+        'jsonb': 'JSON',
+        'uuid': 'UUID',
+        'numeric': 'Numeric',
+        'double precision': 'Float',
+        'real': 'Float',
+    }
+
+    def __init__(self, db_url: str):
+        self.db_url = db_url
+        self._conn = None
+
+    def connect(self) -> bool:
+        """Establish database connection."""
+        try:
+            import psycopg2
+            self._conn = psycopg2.connect(self.db_url)
+            return True
+        except ImportError:
+            print("[!] psycopg2 not installed. Run: pip install psycopg2-binary")
+            return False
+        except Exception as e:
+            print(f"[!] Failed to connect to database: {e}")
+            return False
+
+    def close(self):
+        """Close database connection."""
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
+    def get_live_schema(self, schema: str = 'public') -> Dict[str, LiveDBTable]:
+        """Fetch actual schema from database."""
+        if not self._conn:
+            return {}
+
+        tables = {}
+        cursor = self._conn.cursor()
+
+        # Get all tables in schema
+        cursor.execute("""
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = %s
+              AND table_type = 'BASE TABLE'
+              AND table_name NOT LIKE 'alembic%%'
+        """, (schema,))
+
+        for (table_name,) in cursor.fetchall():
+            tables[table_name] = LiveDBTable(name=table_name)
+
+            # Get columns for this table
+            cursor.execute("""
+                SELECT column_name, data_type, is_nullable, column_default
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                ORDER BY ordinal_position
+            """, (schema, table_name))
+
+            for col_name, data_type, is_nullable, col_default in cursor.fetchall():
+                tables[table_name].columns[col_name] = LiveDBColumn(
+                    name=col_name,
+                    data_type=data_type,
+                    is_nullable=(is_nullable == 'YES'),
+                    column_default=col_default
+                )
+
+        cursor.close()
+        return tables
+
+    def compare_schemas(
+        self,
+        migration_tables: Dict[str, TableSchema],
+        live_tables: Dict[str, LiveDBTable]
+    ) -> List[SchemaDrift]:
+        """Compare migration schema with live database."""
+        issues = []
+
+        # Check tables defined in migrations
+        for table_name, migration_table in migration_tables.items():
+            if table_name not in live_tables:
+                issues.append(SchemaDrift(
+                    table=table_name,
+                    issue_type='missing_table',
+                    details=f"Table '{table_name}' defined in migrations but missing in database"
+                ))
+                continue
+
+            live_table = live_tables[table_name]
+
+            # Check columns
+            for col_name, migration_col in migration_table.columns.items():
+                if col_name not in live_table.columns:
+                    issues.append(SchemaDrift(
+                        table=table_name,
+                        issue_type='missing_column',
+                        details=f"Column '{table_name}.{col_name}' defined in migrations but missing in database"
+                    ))
+                else:
+                    # Check type compatibility (optional, can be noisy)
+                    live_col = live_table.columns[col_name]
+                    expected_type = self._normalize_type(migration_col.type)
+                    actual_type = self._normalize_pg_type(live_col.data_type)
+
+                    if expected_type and actual_type and expected_type != actual_type:
+                        issues.append(SchemaDrift(
+                            table=table_name,
+                            issue_type='type_mismatch',
+                            details=(
+                                f"Column '{table_name}.{col_name}' type mismatch: "
+                                f"migrations={migration_col.type}, database={live_col.data_type}"
+                            )
+                        ))
+
+        # Check for extra tables in database (not in migrations)
+        system_tables = {'alembic_version', 'spatial_ref_sys'}
+        for table_name in live_tables:
+            if table_name not in migration_tables and table_name not in system_tables:
+                issues.append(SchemaDrift(
+                    table=table_name,
+                    issue_type='extra_table',
+                    details=f"Table '{table_name}' exists in database but not defined in migrations"
+                ))
+
+        # Check for extra columns in database
+        for table_name, live_table in live_tables.items():
+            if table_name not in migration_tables:
+                continue
+
+            migration_cols = migration_tables[table_name].columns
+            for col_name in live_table.columns:
+                if col_name not in migration_cols and col_name != 'id':
+                    issues.append(SchemaDrift(
+                        table=table_name,
+                        issue_type='extra_column',
+                        details=f"Column '{table_name}.{col_name}' exists in database but not in migrations"
+                    ))
+
+        return issues
+
+    def _normalize_type(self, sa_type: str) -> Optional[str]:
+        """Normalize SQLAlchemy type name."""
+        return sa_type.lower() if sa_type else None
+
+    def _normalize_pg_type(self, pg_type: str) -> Optional[str]:
+        """Convert PostgreSQL type to normalized name."""
+        pg_type_lower = pg_type.lower()
+        mapped = self.PG_TYPE_MAP.get(pg_type_lower)
+        return mapped.lower() if mapped else pg_type_lower
+
+
+# ============================================================================
 # Main Analyzer
 # ============================================================================
 
 class BlastRadiusAnalyzer:
     """Main analyzer combining all parsers."""
 
-    def __init__(self, project_root: str):
+    def __init__(self, project_root: str, db_url: Optional[str] = None):
         self.project_root = Path(project_root)
+        self.db_url = db_url
         self.docker_parser = DockerComposeParser()
         self.migration_parser = MigrationParser()
         self.model_parser = SQLAlchemyModelParser()
         self.sync_checker = SyncChecker()
         self.idempotency_checker = IdempotencyChecker()
+        self.live_schema_checker = LiveSchemaChecker(db_url) if db_url else None
 
     def analyze(self, profile: dict) -> AnalysisResult:
         result = AnalysisResult()
@@ -461,8 +666,21 @@ class BlastRadiusAnalyzer:
         if models_path.exists():
             result.model_fields = self.model_parser.parse_file(str(models_path))
 
-        # 4. Sync check
+        # 4. Sync check (models vs migrations)
         result.sync_issues = self.sync_checker.check(result.db_tables, result.model_fields)
+
+        # 5. Live DB check (migrations vs actual database)
+        if self.live_schema_checker and self.live_schema_checker.connect():
+            try:
+                # Get schema from profile or default to 'public'
+                db_schema = profile.get('db_schema', 'public')
+                result.live_db_tables = self.live_schema_checker.get_live_schema(db_schema)
+                result.schema_drift = self.live_schema_checker.compare_schemas(
+                    result.db_tables,
+                    result.live_db_tables
+                )
+            finally:
+                self.live_schema_checker.close()
 
         return result
 
@@ -518,6 +736,34 @@ class BlastRadiusAnalyzer:
         else:
             print("\n[IDEMPOTENCY] All migrations are idempotent")
 
+        # Schema Drift (Live DB)
+        if result.live_db_tables:
+            print(f"\n[LIVE DB] Connected, found {len(result.live_db_tables)} tables")
+            if result.schema_drift:
+                print(f"\n[SCHEMA DRIFT] Found {len(result.schema_drift)} issues:")
+                # Group by issue type
+                by_type = {}
+                for drift in result.schema_drift:
+                    by_type.setdefault(drift.issue_type, []).append(drift)
+
+                type_labels = {
+                    'missing_table': '🔴 MISSING TABLES (in migrations, not in DB)',
+                    'missing_column': '🔴 MISSING COLUMNS (in migrations, not in DB)',
+                    'extra_table': '🟡 EXTRA TABLES (in DB, not in migrations)',
+                    'extra_column': '🟡 EXTRA COLUMNS (in DB, not in migrations)',
+                    'type_mismatch': '🟠 TYPE MISMATCHES',
+                }
+
+                for issue_type, label in type_labels.items():
+                    if issue_type in by_type:
+                        print(f"\n  {label}:")
+                        for drift in by_type[issue_type]:
+                            print(f"    - {drift.details}")
+            else:
+                print("\n[SCHEMA DRIFT] Database matches migrations ✓")
+        elif self.db_url:
+            print("\n[LIVE DB] Failed to connect to database")
+
         print("\n" + "=" * 60)
 
 
@@ -539,12 +785,19 @@ def main():
         help='Path to project profile JSON (optional)'
     )
     parser.add_argument(
+        '--db-url', '-d',
+        help='PostgreSQL connection URL (e.g., postgresql://user:pass@host:5432/db)'
+    )
+    parser.add_argument(
         '--json', '-j',
         action='store_true',
         help='Output as JSON'
     )
 
     args = parser.parse_args()
+
+    # Also check DATABASE_URL environment variable
+    db_url = args.db_url or os.environ.get('DATABASE_URL')
 
     # Default profile
     profile = {
@@ -556,13 +809,14 @@ def main():
         with open(args.profile, 'r') as f:
             profile = json.load(f)
 
-    analyzer = BlastRadiusAnalyzer(args.project)
+    analyzer = BlastRadiusAnalyzer(args.project, db_url=db_url)
     result = analyzer.analyze(profile)
 
     if args.json:
         output = {
             "services": len(result.services),
-            "tables": len(result.db_tables),
+            "tables_in_migrations": len(result.db_tables),
+            "tables_in_database": len(result.live_db_tables),
             "models": len(result.model_fields),
             "sync_issues": result.sync_issues,
             "idempotency_issues": [
@@ -573,6 +827,14 @@ def main():
                     "message": issue.message
                 }
                 for issue in result.idempotency_issues
+            ],
+            "schema_drift": [
+                {
+                    "table": drift.table,
+                    "issue_type": drift.issue_type,
+                    "details": drift.details
+                }
+                for drift in result.schema_drift
             ]
         }
         print(json.dumps(output, indent=2))
@@ -580,7 +842,8 @@ def main():
         analyzer.print_report(result)
 
     # Exit code based on issues
-    has_issues = result.sync_issues or result.idempotency_issues
+    critical_drift = [d for d in result.schema_drift if d.issue_type in ('missing_table', 'missing_column')]
+    has_issues = result.sync_issues or result.idempotency_issues or critical_drift
     exit(1 if has_issues else 0)
 
 

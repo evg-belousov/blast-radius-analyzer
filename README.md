@@ -8,15 +8,33 @@ Static analysis tool to predict impact of code changes in multi-service systems.
 - **Migration Parser**: Extract DB schema from Alembic migrations
 - **Model Parser**: Extract SQLAlchemy model definitions
 - **Sync Checker**: Detect mismatches between models and migrations
+- **Idempotency Checker**: Detect non-idempotent migration patterns
+- **Live DB Checker**: Compare migrations with actual PostgreSQL schema
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
 
 ## Usage
 
 ```bash
-# Analyze vovan-space project
+# Basic analysis (static only)
 python impact_analyzer.py --project /path/to/vovan-space
 
+# With live database check
+python impact_analyzer.py -p /path/to/project --db-url postgresql://user:pass@host:5432/db
+
+# Using DATABASE_URL environment variable
+export DATABASE_URL=postgresql://user:pass@host:5432/db
+python impact_analyzer.py -p /path/to/project
+
+# JSON output
+python impact_analyzer.py -p /path/to/project --json
+
 # With custom profile
-python impact_analyzer.py --project /path/to/project --profile profiles/custom.json
+python impact_analyzer.py -p /path/to/project --profile profiles/custom.json
 ```
 
 ## Example Output
@@ -26,25 +44,73 @@ python impact_analyzer.py --project /path/to/project --profile profiles/custom.j
 BLAST RADIUS ANALYZER - REPORT
 ============================================================
 
-[SERVICES] Found 7 services:
-  - launcher: ports=8000:8000, depends_on=[db]
+[SERVICES] Found 9 services:
+  - launcher: ports=none, depends_on=[db]
   - zoo-galaxy-backend: ports=none, depends_on=[db]
   ...
 
-[DATABASE] Found 4 tables in migrations:
-  - users: 9 columns
-  - tasks: 12 columns
+[DATABASE] Found 7 tables in migrations:
+  - users: 10 columns
+  - tasks: 16 columns
+  - achievements: 14 columns
   ...
 
-[SYNC ISSUES] Found 4 issues:
-  ⚠️  MISSING COLUMN: 'tasks.image_url' (String) exists in model but not in migrations
-  ⚠️  MISSING COLUMN: 'tasks.title_en' (String) exists in model but not in migrations
+[MODELS] Found 7 models:
+  - users: 10 fields
+  - tasks: 16 fields
   ...
+
+[SYNC] All models match migrations
+
+[IDEMPOTENCY] All migrations are idempotent
+
+[LIVE DB] Connected, found 7 tables
+
+[SCHEMA DRIFT] Found 2 issues:
+
+  MISSING COLUMNS (in migrations, not in DB):
+    - Column 'achievements.name_en' defined in migrations but missing in database
+
+  EXTRA COLUMNS (in DB, not in migrations):
+    - Column 'users.legacy_field' exists in database but not in migrations
+
+============================================================
+```
+
+## Checks Performed
+
+| Check | What it detects | Severity |
+|-------|----------------|----------|
+| **Sync Check** | Model fields missing in migrations | Critical |
+| **Idempotency** | Migrations that can fail on retry | Warning |
+| **Missing Table** | Table in migrations, not in DB | Critical |
+| **Missing Column** | Column in migrations, not in DB | Critical |
+| **Extra Table** | Table in DB, not in migrations | Warning |
+| **Extra Column** | Column in DB, not in migrations | Warning |
+| **Type Mismatch** | Column type differs between migration and DB | Warning |
+
+## Exit Codes
+
+- `0` - No critical issues found
+- `1` - Critical issues detected (sync issues, missing tables/columns, non-idempotent migrations)
+
+## Profile Configuration
+
+```json
+{
+  "project_name": "vovan-space",
+  "infrastructure": "docker-compose.yml",
+  "db_schema": "public"
+}
 ```
 
 ## Roadmap
 
-- [ ] Step 1: Static Spine (docker + SQL + models) ← **Current**
-- [ ] Step 2: API Route Scanner (grep fetch calls)
-- [ ] Step 3: Git diff integration
-- [ ] Step 4: LLM Reasoner for impact explanation
+- [x] Step 1: Static Spine (docker + SQL + models)
+- [x] Step 2: Idempotency Checker
+- [x] Step 3: Live Database Schema Comparison
+- [ ] Step 4: Foreign Key Consistency Check
+- [ ] Step 5: Environment Variable Validation
+- [ ] Step 6: Circular Dependency Detection
+- [ ] Step 7: Git diff integration
+- [ ] Step 8: LLM Reasoner for impact explanation
