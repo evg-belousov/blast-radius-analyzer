@@ -57,12 +57,22 @@ class ModelField:
 
 
 @dataclass
+class IdempotencyIssue:
+    """Non-idempotent migration issue."""
+    file: str
+    table: str
+    columns: List[str]
+    message: str
+
+
+@dataclass
 class AnalysisResult:
     """Complete analysis result."""
     services: Dict[str, ServiceNode] = field(default_factory=dict)
     db_tables: Dict[str, TableSchema] = field(default_factory=dict)
     model_fields: Dict[str, Dict[str, ModelField]] = field(default_factory=dict)
     sync_issues: List[str] = field(default_factory=list)
+    idempotency_issues: List[IdempotencyIssue] = field(default_factory=list)
     dependency_graph: Dict[str, List[str]] = field(default_factory=dict)
 
 
@@ -273,6 +283,139 @@ class SyncChecker:
 
 
 # ============================================================================
+# Idempotency Checker
+# ============================================================================
+
+class IdempotencyChecker:
+    """Check for non-idempotent migration patterns.
+
+    Detects migrations that use table_exists() check but don't handle
+    the case where table exists but is missing columns (partial migration).
+    """
+
+    def check_directory(self, migrations_dir: str) -> List[IdempotencyIssue]:
+        issues = []
+        migrations_path = Path(migrations_dir)
+
+        if not migrations_path.exists():
+            return issues
+
+        for migration_file in migrations_path.glob('*.py'):
+            file_issues = self._check_migration(migration_file)
+            issues.extend(file_issues)
+
+        return issues
+
+    def _check_migration(self, filepath: Path) -> List[IdempotencyIssue]:
+        issues = []
+        content = filepath.read_text(encoding='utf-8')
+
+        # Find all table_exists checks with create_table
+        # Pattern: if not table_exists('tablename'): ... create_table('tablename', ...)
+        table_exists_pattern = re.compile(
+            r"if\s+not\s+table_exists\s*\(\s*['\"](\w+)['\"]\s*\)",
+            re.MULTILINE
+        )
+
+        for match in table_exists_pattern.finditer(content):
+            table_name = match.group(1)
+            check_pos = match.start()
+
+            # Find the create_table block for this table
+            columns = self._find_columns_in_create_table(content, table_name, check_pos)
+
+            if not columns:
+                continue
+
+            # Check if there's an else block with column_exists checks
+            columns_with_fallback = self._find_column_exists_checks(content, table_name, check_pos)
+
+            # Find columns that are created but have no fallback
+            unprotected_columns = [col for col in columns if col not in columns_with_fallback]
+
+            if unprotected_columns:
+                issues.append(IdempotencyIssue(
+                    file=filepath.name,
+                    table=table_name,
+                    columns=unprotected_columns,
+                    message=(
+                        f"Non-idempotent migration: table '{table_name}' uses table_exists() "
+                        f"but has no column_exists() fallback for: {', '.join(unprotected_columns)}. "
+                        f"If migration fails mid-way, these columns won't be added on retry."
+                    )
+                ))
+
+        return issues
+
+    def _find_columns_in_create_table(self, content: str, table_name: str, after_pos: int) -> List[str]:
+        """Find all columns defined in create_table for given table."""
+        columns = []
+
+        # Look for create_table('table_name', ...) after the table_exists check
+        search_content = content[after_pos:]
+
+        # Find create_table call
+        create_pattern = re.compile(
+            rf"op\.create_table\s*\(\s*['\"]({re.escape(table_name)})['\"]",
+            re.MULTILINE
+        )
+        create_match = create_pattern.search(search_content)
+
+        if not create_match:
+            return columns
+
+        # Find the block boundaries (count parentheses)
+        start_pos = create_match.start()
+        paren_depth = 0
+        in_block = False
+        block_content = []
+
+        for i, char in enumerate(search_content[start_pos:]):
+            if char == '(':
+                paren_depth += 1
+                in_block = True
+            elif char == ')':
+                paren_depth -= 1
+
+            if in_block:
+                block_content.append(char)
+
+            if in_block and paren_depth == 0:
+                break
+
+        block_text = ''.join(block_content)
+
+        # Find all Column definitions
+        col_pattern = re.compile(r"sa\.Column\s*\(\s*['\"](\w+)['\"]")
+        for col_match in col_pattern.finditer(block_text):
+            col_name = col_match.group(1)
+            # Skip common auto columns
+            if col_name not in ('id',):
+                columns.append(col_name)
+
+        return columns
+
+    def _find_column_exists_checks(self, content: str, table_name: str, after_pos: int) -> List[str]:
+        """Find columns that have column_exists fallback checks."""
+        protected_columns = []
+
+        # Look for else block and column_exists checks
+        search_content = content[after_pos:]
+
+        # Pattern for column_exists check: column_exists('table', 'column')
+        col_exists_pattern = re.compile(
+            rf"column_exists\s*\(\s*['\"]({re.escape(table_name)})['\"],\s*['\"](\w+)['\"]",
+            re.MULTILINE
+        )
+
+        for match in col_exists_pattern.finditer(search_content):
+            if match.group(1) == table_name:
+                protected_columns.append(match.group(2))
+
+        return protected_columns
+
+
+# ============================================================================
 # Main Analyzer
 # ============================================================================
 
@@ -285,6 +428,7 @@ class BlastRadiusAnalyzer:
         self.migration_parser = MigrationParser()
         self.model_parser = SQLAlchemyModelParser()
         self.sync_checker = SyncChecker()
+        self.idempotency_checker = IdempotencyChecker()
 
     def analyze(self, profile: dict) -> AnalysisResult:
         result = AnalysisResult()
@@ -299,6 +443,8 @@ class BlastRadiusAnalyzer:
         migrations_dir = self.project_root / 'alembic' / 'versions'
         if migrations_dir.exists():
             result.db_tables = self.migration_parser.parse_directory(str(migrations_dir))
+            # Check for non-idempotent patterns
+            result.idempotency_issues = self.idempotency_checker.check_directory(str(migrations_dir))
 
         # 3. Models
         models_path = self.project_root / 'app' / 'models.py'
@@ -346,13 +492,21 @@ class BlastRadiusAnalyzer:
         for name, fields in result.model_fields.items():
             print(f"  - {name}: {len(fields)} fields")
 
-        # Issues
+        # Sync Issues
         if result.sync_issues:
             print(f"\n[SYNC ISSUES] Found {len(result.sync_issues)} issues:")
             for issue in result.sync_issues:
                 print(f"  [!] {issue}")
         else:
             print("\n[SYNC] All models match migrations")
+
+        # Idempotency Issues
+        if result.idempotency_issues:
+            print(f"\n[IDEMPOTENCY] Found {len(result.idempotency_issues)} non-idempotent migrations:")
+            for issue in result.idempotency_issues:
+                print(f"  [!] {issue.file}: {issue.message}")
+        else:
+            print("\n[IDEMPOTENCY] All migrations are idempotent")
 
         print("\n" + "=" * 60)
 
@@ -400,14 +554,24 @@ def main():
             "services": len(result.services),
             "tables": len(result.db_tables),
             "models": len(result.model_fields),
-            "issues": result.sync_issues
+            "sync_issues": result.sync_issues,
+            "idempotency_issues": [
+                {
+                    "file": issue.file,
+                    "table": issue.table,
+                    "columns": issue.columns,
+                    "message": issue.message
+                }
+                for issue in result.idempotency_issues
+            ]
         }
         print(json.dumps(output, indent=2))
     else:
         analyzer.print_report(result)
 
     # Exit code based on issues
-    exit(1 if result.sync_issues else 0)
+    has_issues = result.sync_issues or result.idempotency_issues
+    exit(1 if has_issues else 0)
 
 
 if __name__ == '__main__':
